@@ -53,6 +53,7 @@ INSTALLED_APPS = [
 
     "rest_framework",
     "accounts.apps.AccountsConfig",
+    "organizations.apps.OrganizationsConfig",
 ]
 
 AUTH_USER_MODEL = "accounts.User"
