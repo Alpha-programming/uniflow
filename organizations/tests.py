@@ -7,6 +7,13 @@ from .models import Membership, Organization, Team, JobTitle, Scope
 from unittest.mock import patch
 from .services import create_organization
 from .models import AccessProfile
+from .policies import can_manage_member
+from rest_framework.exceptions import (
+    PermissionDenied,
+    ValidationError as ApiValidationError,
+)
+from config.errors import VersionConflict
+from .services import change_member_job_title
 
 
 class MembershipTests(TestCase):
@@ -519,3 +526,365 @@ class ScopeTests(TestCase):
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 Scope.objects.create(**data)
+
+class ManageMemberPolicyTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        User = get_user_model()
+
+        cls.organization = Organization.objects.create(
+            name="Policy Company",
+            country_code="UZ",
+            time_zone="Asia/Tashkent",
+        )
+
+        cls.team = Team.objects.create(
+            organization=cls.organization,
+            name="Development",
+        )
+
+        cls.other_team = Team.objects.create(
+            organization=cls.organization,
+            name="Design",
+        )
+
+        cls.profile = AccessProfile.objects.create(
+            organization=cls.organization,
+            name="Manager",
+            capabilities=["people.manage_scoped"],
+        )
+
+        cls.owner = Membership.objects.create(
+            organization=cls.organization,
+            user=User.objects.create_user(
+                username="policy-owner",
+            ),
+            system_role="owner",
+            rank=1,
+        )
+
+        cls.manager = Membership.objects.create(
+            organization=cls.organization,
+            user=User.objects.create_user(
+                username="policy-manager",
+            ),
+            team=cls.team,
+            access_profile=cls.profile,
+            rank=2,
+        )
+
+        cls.employee = Membership.objects.create(
+            organization=cls.organization,
+            user=User.objects.create_user(
+                username="policy-employee",
+            ),
+            team=cls.team,
+            rank=3,
+        )
+
+        Scope.objects.create(
+            membership=cls.manager,
+            capability="people.manage_scoped",
+            kind="team",
+            team=cls.team,
+        )
+
+    def allowed(self, actor, target):
+        return can_manage_member(
+            actor_membership_id=actor.pk,
+            target_membership_id=target.pk,
+        )
+
+    def test_owner_can_manage_company_member(self):
+        self.assertTrue(
+            self.allowed(self.owner, self.employee)
+        )
+
+    def test_cross_company_access_is_denied(self):
+        other_organization = Organization.objects.create(
+            name="External Company",
+            country_code="UZ",
+            time_zone="Asia/Tashkent",
+        )
+
+        self.employee.organization = other_organization
+        self.employee.team = None
+        self.employee.save(
+            update_fields=["organization", "team"],
+        )
+
+        self.assertFalse(
+            self.allowed(self.owner, self.employee)
+        )
+        self.assertFalse(
+            self.allowed(self.manager, self.employee)
+        )
+
+    def test_manager_can_manage_lower_rank_in_own_team(self):
+        self.assertTrue(
+            self.allowed(self.manager, self.employee)
+        )
+
+    def test_equal_and_higher_ranks_are_denied(self):
+        for rank in (1, 2):
+            with self.subTest(rank=rank):
+                self.employee.rank = rank
+                self.employee.save(update_fields=["rank"])
+
+                self.assertFalse(
+                    self.allowed(self.manager, self.employee)
+                )
+
+    def test_other_team_is_denied(self):
+        self.employee.team = self.other_team
+        self.employee.save(update_fields=["team"])
+
+        self.assertFalse(
+            self.allowed(self.manager, self.employee)
+        )
+
+    def test_self_management_is_denied(self):
+        self.assertFalse(
+            self.allowed(self.manager, self.manager)
+        )
+        self.assertFalse(
+            self.allowed(self.owner, self.owner)
+        )
+
+    def test_profile_and_scope_are_both_required(self):
+        self.profile.is_active = False
+        self.profile.save(update_fields=["is_active"])
+
+        self.assertFalse(
+            self.allowed(self.manager, self.employee)
+        )
+
+        self.profile.is_active = True
+        self.profile.capabilities = []
+        self.profile.save(
+            update_fields=["is_active", "capabilities"],
+        )
+
+        self.assertFalse(
+            self.allowed(self.manager, self.employee)
+        )
+
+        self.profile.capabilities = ["people.manage_scoped"]
+        self.profile.save(update_fields=["capabilities"])
+
+        self.manager.scopes.all().delete()
+
+        self.assertFalse(
+            self.allowed(self.manager, self.employee)
+        )
+
+    def test_learner_is_not_a_lower_rank_employee(self):
+        self.employee.participant_type = "learner"
+        self.employee.rank = None
+        self.employee.save(
+            update_fields=["participant_type", "rank"],
+        )
+
+        self.assertFalse(
+            self.allowed(self.manager, self.employee)
+        )
+        self.assertTrue(
+            self.allowed(self.owner, self.employee)
+        )
+
+    def test_inactive_actor_is_denied(self):
+        self.manager.is_active = False
+        self.manager.save(update_fields=["is_active"])
+
+        self.assertFalse(
+            self.allowed(self.manager, self.employee)
+        )
+
+class ChangeMemberJobTitleTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        User = get_user_model()
+
+        cls.owner_user = User.objects.create_user(
+            username="title-change-owner",
+        )
+
+        cls.organization = create_organization(
+            owner=cls.owner_user,
+            name="Title Change Company",
+            country_code="UZ",
+            time_zone="Asia/Tashkent",
+        )
+
+        cls.employee = Membership.objects.create(
+            organization=cls.organization,
+            user=User.objects.create_user(
+                username="title-change-employee",
+            ),
+            rank=4,
+        )
+
+        cls.title = JobTitle.objects.create(
+            organization=cls.organization,
+            name="Designer",
+        )
+
+    def change_title(self, **overrides):
+        data = {
+            "actor": self.owner_user,
+            "organization_id": self.organization.pk,
+            "membership_id": self.employee.pk,
+            "job_title_id": self.title.pk,
+            "expected_version": 1,
+        }
+        data.update(overrides)
+
+        return change_member_job_title(**data)
+
+    def test_owner_can_change_title(self):
+        result = self.change_title()
+        result.refresh_from_db()
+
+        self.assertEqual(result.job_title_id, self.title.pk)
+        self.assertEqual(result.version, 2)
+        self.assertEqual(result.rank, 4)
+        self.assertEqual(result.system_role, "member")
+        self.assertIsNone(result.access_profile_id)
+
+    def test_stale_version_does_not_overwrite_changes(self):
+        self.change_title()
+
+        with self.assertRaises(VersionConflict):
+            self.change_title(job_title_id=None)
+
+        self.employee.refresh_from_db()
+
+        self.assertEqual(
+            self.employee.job_title_id,
+            self.title.pk,
+        )
+        self.assertEqual(self.employee.version, 2)
+
+    def test_title_can_be_removed(self):
+        self.change_title()
+
+        result = self.change_title(
+            job_title_id=None,
+            expected_version=2,
+        )
+
+        self.assertIsNone(result.job_title_id)
+        self.assertEqual(result.version, 3)
+
+    def test_outsider_cannot_change_title(self):
+        outsider = get_user_model().objects.create_user(
+            username="title-change-outsider",
+        )
+
+        with self.assertRaises(PermissionDenied):
+            self.change_title(actor=outsider)
+
+        self.employee.refresh_from_db()
+
+        self.assertIsNone(self.employee.job_title_id)
+        self.assertEqual(self.employee.version, 1)
+
+    def test_inactive_title_is_rejected(self):
+        self.title.is_active = False
+        self.title.save(update_fields=["is_active"])
+
+        with self.assertRaises(ApiValidationError):
+            self.change_title()
+
+        self.employee.refresh_from_db()
+
+        self.assertIsNone(self.employee.job_title_id)
+        self.assertEqual(self.employee.version, 1)
+
+    def test_title_from_another_company_is_rejected(self):
+        other_organization = Organization.objects.create(
+            name="External Title Company",
+            country_code="UZ",
+            time_zone="Asia/Tashkent",
+        )
+
+        foreign_title = JobTitle.objects.create(
+            organization=other_organization,
+            name="External Director",
+        )
+
+        with self.assertRaises(ApiValidationError):
+            self.change_title(
+                job_title_id=foreign_title.pk,
+            )
+
+        self.employee.refresh_from_db()
+
+        self.assertIsNone(self.employee.job_title_id)
+        self.assertEqual(self.employee.version, 1)
+
+    def test_manager_needs_scope_to_change_title(self):
+        team = Team.objects.create(
+            organization=self.organization,
+            name="Design Team",
+        )
+
+        profile = AccessProfile.objects.create(
+            organization=self.organization,
+            name="Design Manager",
+            capabilities=["people.manage_scoped"],
+        )
+
+        manager_user = get_user_model().objects.create_user(
+            username="title-change-manager",
+        )
+
+        manager = Membership.objects.create(
+            organization=self.organization,
+            user=manager_user,
+            team=team,
+            rank=2,
+            access_profile=profile,
+        )
+
+        self.employee.team = team
+        self.employee.save(update_fields=["team"])
+
+        # Одного профиля недостаточно: область ещё не выдана.
+        with self.assertRaises(PermissionDenied):
+            self.change_title(actor=manager_user)
+
+        self.employee.refresh_from_db()
+
+        self.assertIsNone(self.employee.job_title_id)
+        self.assertEqual(self.employee.version, 1)
+
+        Scope.objects.create(
+            membership=manager,
+            capability="people.manage_scoped",
+            kind="team",
+            team=team,
+        )
+
+        result = self.change_title(actor=manager_user)
+
+        self.assertEqual(result.job_title_id, self.title.pk)
+        self.assertEqual(result.version, 2)
+
+        # После отзыва области следующие изменения запрещены.
+        manager.scopes.all().delete()
+
+        with self.assertRaises(PermissionDenied):
+            self.change_title(
+                actor=manager_user,
+                job_title_id=None,
+                expected_version=2,
+            )
+
+        self.employee.refresh_from_db()
+
+        self.assertEqual(
+            self.employee.job_title_id,
+            self.title.pk,
+        )
+        self.assertEqual(self.employee.version, 2)
